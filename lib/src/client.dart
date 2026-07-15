@@ -3396,37 +3396,6 @@ class Client extends MatrixApi {
         final response = await queryKeys(outdatedLists, timeout: 10000);
         if (!isLogged()) return;
 
-        // A cross-signing reset rotates a user's cross-signing keys without
-        // changing their device ed25519 keys. Cached per-signature verdicts in
-        // validSignatures were computed against the OLD cross-signing identity,
-        // so they must not be carried forward for a user whose cross-signing
-        // keys changed in this update — otherwise a stale verdict (e.g. a
-        // `false` cached during the reset race) survives every future
-        // keys/query and crossVerified never re-evaluates against the new
-        // identity. Collect those users so the carry-forward below skips them.
-        final crossSigningChangedUserIds = <String>{};
-        for (final incomingKeys in [
-          response.masterKeys,
-          response.selfSigningKeys,
-          response.userSigningKeys,
-        ]) {
-          if (incomingKeys == null) continue;
-          for (final incomingEntry in incomingKeys.entries) {
-            final userId = incomingEntry.key;
-            final incomingPublicKey = incomingEntry.value.publicKey;
-            final cached = _userDeviceKeys[userId]?.crossSigningKeys;
-            // Only a real rotation matters: a public key we have never cached
-            // before, replacing a non-empty existing set. A first-time fetch
-            // (empty cache) has no stale verdicts to invalidate.
-            if (incomingPublicKey != null &&
-                cached != null &&
-                cached.isNotEmpty &&
-                !cached.containsKey(incomingPublicKey)) {
-              crossSigningChangedUserIds.add(userId);
-            }
-          }
-        }
-
         final deviceKeys = response.deviceKeys;
         if (deviceKeys != null) {
           for (final rawDeviceKeyListEntry in deviceKeys.entries) {
@@ -3503,11 +3472,7 @@ class Client extends MatrixApi {
                     // be sure to save the verified status
                     entry.setDirectVerified(oldKey.directVerified);
                     entry.blocked = oldKey.blocked;
-                    // Drop cached signature verdicts when the signing
-                    // cross-signing identity rotated; force re-validation.
-                    if (!crossSigningChangedUserIds.contains(userId)) {
-                      entry.validSignatures = oldKey.validSignatures;
-                    }
+                    entry.validSignatures = oldKey.validSignatures;
                   }
                   userKeys.deviceKeys[deviceId] = entry;
                   if (deviceId == deviceID &&
@@ -3604,11 +3569,7 @@ class Client extends MatrixApi {
                     );
                   }
                   entry.blocked = oldKey.blocked;
-                  // Drop cached signature verdicts when this user's
-                  // cross-signing identity rotated; force re-validation.
-                  if (!crossSigningChangedUserIds.contains(userId)) {
-                    entry.validSignatures = oldKey.validSignatures;
-                  }
+                  entry.validSignatures = oldKey.validSignatures;
                 }
                 userKeys.crossSigningKeys[publicKey] = entry;
               } else {

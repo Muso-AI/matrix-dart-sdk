@@ -486,4 +486,100 @@ void main() async {
       await client.dispose(closeDatabase: true);
     });
   });
+
+  // Regression: a cross-signing reset rotates the master key WITHOUT changing
+  // device ed25519 keys. Cached per-signature verdicts in validSignatures were
+  // computed against the OLD identity, so on a keys/query refresh they must be
+  // dropped for a user whose cross-signing keys rotated — otherwise a stale
+  // `false` survives forever and crossVerified never re-evaluates.
+  group('Cross-signing rotation invalidates cached validSignatures',
+      tags: 'olm', () {
+    late Client client;
+    Future? vodInit;
+    const testUser = '@test:fakeServer.notExisting';
+    const selfSigningPub = 'F9ypFzgbISXCzxQhhSnXMkc1vq12Luna3Nw5rqViOJY';
+
+    test('setupClient', () async {
+      vodInit ??= vod.init(
+        wasmPath: './pkg/',
+        libraryPath: './rust/target/debug/',
+      );
+      await vodInit;
+      client = await getClient();
+      await client.abortSync();
+      await client.updateUserDeviceKeys();
+      // Sanity: the fixture caches the master key we are about to rotate.
+      expect(client.userDeviceKeys[testUser]?.masterKey?.publicKey,
+          '82mAXjsmbTbrE6zyShpR869jnrANO75H8nYY0nDLoJ8');
+    });
+
+    test('carries validSignatures forward when nothing rotated', () async {
+      final device = client.userDeviceKeys[testUser]!.deviceKeys['OTHERDEVICE']!;
+      final planted = {
+        testUser: {'ed25519:82mAXjsmbTbrE6zyShpR869jnrANO75H8nYY0nDLoJ8': true},
+      };
+      device.validSignatures = planted;
+
+      client.userDeviceKeys[testUser]!.outdated = true;
+      await client.updateUserDeviceKeys();
+
+      // Unchanged identity => the cached verdict is preserved (control).
+      expect(
+        client.userDeviceKeys[testUser]!.deviceKeys['OTHERDEVICE']!
+            .validSignatures,
+        planted,
+      );
+    });
+
+    test('drops validSignatures on device and cross-signing keys when the '
+        'master rotates', () async {
+      // Plant stale verdicts on a device key (ed25519 unchanged across the
+      // refresh) and on the self-signing cross-signing key (public key
+      // unchanged) — both would normally be carried forward.
+      final device = client.userDeviceKeys[testUser]!.deviceKeys['GHTYAJCE']!;
+      final selfSigning =
+          client.userDeviceKeys[testUser]!.crossSigningKeys[selfSigningPub]!;
+      device.validSignatures = {
+        testUser: {'ed25519:82mAXjsmbTbrE6zyShpR869jnrANO75H8nYY0nDLoJ8': false},
+      };
+      selfSigning.validSignatures = {
+        testUser: {'ed25519:82mAXjsmbTbrE6zyShpR869jnrANO75H8nYY0nDLoJ8': false},
+      };
+
+      // Rotate the master key: a public key never seen before, replacing the
+      // cached one. Device keys and the other cross-signing keys are untouched.
+      final base = FakeMatrixApi
+          .currentApi!.api['POST']!['/client/v3/keys/query'](null)
+          as Map<String, dynamic>;
+      const rotatedPub = 'ROTATEDmasterKeyAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+      FakeMatrixApi.currentApi!.api['POST']!['/client/v3/keys/query'] = (_) {
+        final resp = json.decode(json.encode(base)) as Map<String, dynamic>;
+        resp['master_keys'][testUser]['keys'] = {
+          'ed25519:$rotatedPub': rotatedPub,
+        };
+        return resp;
+      };
+
+      client.userDeviceKeys[testUser]!.outdated = true;
+      await client.updateUserDeviceKeys();
+
+      // Rotation detected => stale verdicts dropped, forcing re-validation.
+      expect(client.userDeviceKeys[testUser]!.masterKey?.publicKey, rotatedPub);
+      expect(
+        client.userDeviceKeys[testUser]!.deviceKeys['GHTYAJCE']!
+            .validSignatures,
+        null,
+      );
+      expect(
+        client
+            .userDeviceKeys[testUser]!.crossSigningKeys[selfSigningPub]
+            ?.validSignatures,
+        null,
+      );
+    });
+
+    test('dispose client', () async {
+      await client.dispose(closeDatabase: true);
+    });
+  });
 }
